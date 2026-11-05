@@ -4,7 +4,14 @@
 
 InstabilitySSL learns representations of stratified shear flows from DNS time–height panels and predicts the pseudomomentum ratio, R_M, as a continuous measure of instability character between Holmboe-like and Kelvin–Helmholtz-like limits.
 
-The main model combines a masked autoencoder (MAE) with a ConvNeXt regression head:
+The framework includes two self-supervised representation-learning architectures:
+
+- **MAE (Masked Autoencoder):** a Transformer encoder–decoder reconstructs masked regions of the physical input fields.
+- **JEPA (Joint Embedding Predictive Architecture):** a convolutional encoder and a predictor learn flow representations by predicting target embeddings from context in latent space.
+
+The main model used in the paper combines MAE with a ConvNeXt regression head. The training and feature-extraction examples below follow this MAE pipeline; `finetune.py` also supports pretrained convolutional JEPA encoders.
+
+The MAE workflow consists of three steps:
 
 1. **Self-supervised pretraining:** reconstruct masked regions of three physical input channels using Pr = 1 simulations.
 2. **Source regression:** freeze the pretrained encoder and train a ConvNeXt head to predict R_M.
@@ -18,12 +25,12 @@ This repository contains source code only. DNS files, prepared datasets, label t
 | --- | --- |
 | `config.py` | MAE architecture, training settings, and default paths |
 | `dataset.py` | HDF5 loading, case filtering, padding, and labels |
-| `models.py` | MAE and regression architectures |
+| `models.py` | MAE, convolutional JEPA, and regression architectures |
 | `prepare_data.py` | Generate Pr = 1 time–height panels from raw DNS files |
 | `train_mae.py` | Self-supervised MAE pretraining |
 | `extract_tokens.py` | Extract spatial encoder features |
 | `train_head.py` | Train the source ConvNeXt regression head |
-| `finetune.py` | Zero-shot inference, head-only, LoRA, and full fine-tuning |
+| `finetune.py` | Zero-shot inference and head-only, LoRA, or full fine-tuning with MAE or JEPA encoders |
 | `evaluate.py` | Evaluate heads using precomputed target features |
 | `visualize_reconstruction.py` | Plot masked reconstructions |
 | `plot_predictions.py` | Plot pooled panel-prediction distributions and seed means |
@@ -131,14 +138,6 @@ python prepare_data.py
 
 The builder reads `mean.h5` and `movie.h5` directly and writes `outputs/pr1_38case_dataset.h5`. Set `DATA_H5` to that output to train on newly generated data. The intended split is 30 training, four validation, and four test cases. Windows start at the first local maximum of the integrated RMS velocity at t >= 30; if none exists, the current implementation falls back to the global maximum. A late start is shifted earlier to fit 200 saved frames. Only discovered cases are processed, so all raw directories must be available to obtain the complete split.
 
-The current builder adds 129 augmented panels to each training case: a complete build contains 12,870 training panels and 1,200 panels in each held-out split. The historical prepared dataset contains 12,612 training panels. The current reduced-shear calculation also differs from the historical preprocessing: it uses `(du/dy)^2 + (dw/dy)^2 - 4*dth/dy`. Its use of `dth/dy` assumes the input scalar has the intended buoyancy scaling; no additional Richardson-number factor is applied. New builds are therefore not a bitwise reproduction of the historical paper input. Preserve the original prepared data when reproducing historical results.
+The current builder adds 129 augmented panels to each training case: a complete build contains 12,870 training panels and 1,200 panels in each held-out split. The historical prepared dataset contains 12,612 training panels.
 
 Use `--help` on the training, feature-extraction, evaluation, and reconstruction scripts for additional options.
-
-## Validation and reproducibility
-
-The current code has passed CPU checks of the pretraining, feature extraction, source regression, zero-shot, head-only, LoRA, full fine-tuning, and plotting workflows on small inputs. A separate comparison with the original implementation matched 924 arrays exactly, including losses, gradients, one-step parameter updates, and features/predictions from the saved MAE v2 and source-head checkpoints on one real panel. These checks do not replace full training runs or a complete regeneration of the DNS dataset.
-
-The noisy-KH dataset lacks dissipation; NaNs in that input channel are filled with -0.62, the source-training mean used in the original workflow. Non-finite buoyancy or reduced-shear inputs are rejected. Regression heads currently expect a 31 × 20 token grid.
-
-MAE `--resume` restores model and optimizer weights, but does not restore random-number or AMP-scaler states. Supply the same architecture and training settings when resuming; an interrupted run is not guaranteed to match an uninterrupted run exactly. Use a fresh output directory for each new experiment.
