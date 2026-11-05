@@ -1,281 +1,136 @@
-# PRISM: ML Turbulence Backbone
+# ShearSSL
 
-This repository is a GitHub-ready backbone extracted from the Drive project
-`ML_turbulence` and the Colab notebook `Colab Notebooks/Train_ML.ipynb`.
+**Inferring Stratified Shear Instability Character via Self-supervised Representation Learning**
 
-It keeps the final multihead epsilon-flow workflow and leaves large datasets,
-checkpoints, logs, and exploratory result folders out of version control.
+ShearSSL learns representations of stratified shear flows from DNS time–height panels and predicts the pseudomomentum ratio, R_M, as a continuous measure of instability character between Holmboe-like and Kelvin–Helmholtz-like limits.
 
-## Included Backbone
+The main model combines a masked autoencoder (MAE) with a ConvNeXt regression head:
 
-- `src/dataset.py`: HDF5 dataset loader and label parsing.
-- `src/models.py`: core neural network modules used by the current epsilon-flow workflow.
-- `src/models_scale_variable.py`: experimental scale-variable architecture retained for reference.
-- `src/train_multihead.py`: shared multihead regression head, baseline model, and loss helpers used by the epsilon-flow workflow.
-- `src/train_multihead_epsilon_flow.py`: train and fine-tune the final model.
-- `src/train_shared_fno_rm_flow.py`: train the compact-latent SharedFNO model
-  that keeps the old variable-wise ViT/cross-variable attention encoder style,
-  adds an FNO spectral mixer, and removes explicit `Pr/Ri/Re/a` conditioning.
-- `src/finetune_shared_fno_rm_flow.py`: fine-tune a pretrained SharedFNO
-  checkpoint with the same head-only warmup schedule used by the earlier
-  fine-tuning workflow.
-- `src/inspect_shared_fno_attention.py`: visualize SharedFNO cross-variable
-  attention maps and RM saliency heatmaps.
-- `src/test_multihead_epsilon_flow.py`: evaluate the model on a split or external test set.
-- `src/infer_log_epsilon_flow.py`: generate log-epsilon field inference.
-- `src/inspect_multihead_epsilon_flow.py`: visualize epsilon-flow reconstructions.
-- `src/inspect_epsilon_flow_cross_attention.py`: visualize cross-variable attention.
-- `src/visualize_flow_inputs.py`: inspect/visualize flow inputs.
-- `src/run_downsample_noise_experiments.py`: sweep test-time input noise and spatial downsampling for a trained checkpoint.
-- `scripts/build_kh_holmboe_dataset_augmented.py`: build the expanded chunked KH/Holmboe dataset.
-- `scripts/dataset_building.py`: shared dataset-building utilities used by the builder script.
-- `scripts/setup_colab_drive_links.py`: create Colab symlinks to `ML_turbulence/experiment/` in Google Drive.
+1. **Self-supervised pretraining:** reconstruct masked regions of three physical input channels using Pr = 1 simulations.
+2. **Source regression:** freeze the pretrained encoder and train a ConvNeXt head to predict R_M.
+3. **Target adaptation:** fine-tune the regression head with the encoder frozen. An optional second stage jointly trains encoder LoRA adapters and the regression head.
 
-## Project Layout
+This repository contains source code only. DNS files, prepared datasets, label tables, extracted features, model weights, and prediction files must be supplied separately.
 
-```text
-.
-├── src/
-├── configs/
-├── data/
-├── checkpoints/
-├── outputs/
-├── docs/
-├── scripts/
-├── requirements.txt
-├── .gitignore
-└── README.md
-```
+## Code
 
-## Setup
+| File | Purpose |
+| --- | --- |
+| `config.py` | MAE architecture, training settings, and default paths |
+| `dataset.py` | HDF5 loading, case filtering, padding, and labels |
+| `models.py` | MAE and regression architectures |
+| `prepare_data.py` | Generate Pr = 1 time–height panels from raw DNS files |
+| `train_mae.py` | Self-supervised MAE pretraining |
+| `extract_tokens.py` | Extract spatial encoder features |
+| `train_head.py` | Train the source ConvNeXt regression head |
+| `finetune.py` | Zero-shot inference, head-only, LoRA, and full fine-tuning |
+| `evaluate.py` | Evaluate heads using precomputed target features |
+| `visualize_reconstruction.py` | Plot masked reconstructions |
+| `plot_predictions.py` | Plot pooled panel-prediction distributions and seed means |
 
-Install PyTorch for your CUDA/CPU environment first, then install the rest:
+## Installation
+
+Use Python 3.10 or later. Install a PyTorch build suitable for your hardware, then install the remaining dependencies:
 
 ```bash
 pip install -r requirements.txt
 ```
 
-## Data
+Run commands from the repository root. Training examples below assume a CUDA-capable GPU; scripts also expose device options.
 
-Large data and checkpoint files are intentionally not stored in git. In Google
-Drive, this project expects your files under:
+## Data and paths
 
-```text
-/content/drive/MyDrive/ML_turbulence/experiment/
-```
+Place the prepared source dataset at `data/pr1_combined_38case_dataset_v2.h5`, or change `DATA_H5` in `config.py`. HDF5 files contain `train`, `val`, and `test` groups, each with `X` and `metadata_json`. Each source panel has shape `(3, 491, 200)` in channel–height–time order. Metadata identifies the parent DNS case. The loader pads the height to 496 points for the network.
 
-After mounting Google Drive in Colab, create repo-local symlinks with:
+The channels are buoyancy, reduced shear, and log dissipation. The MAE uses 16 × 10 patches, a 31 × 20 spatial grid per variable, and a common 50% spatial mask across variables. The `small8` encoder has eight Transformer blocks of width 384; the decoder has four blocks of width 192.
 
-```bash
-python scripts/setup_colab_drive_links.py
-```
+Provide source labels as a CSV with `case_id,R_M` columns (the original `RM_summary_table.csv` format is also supported). Target labels can be supplied as a JSON mapping from case IDs to R_M. Neither label file is included here.
 
-This links the Drive files into `data/` and `checkpoints/`:
+The MAE split and regression-head split are different. The source head uses the validation and test case lists shown below; these should not be replaced with the MAE split by accident. Keep all panels from each designated held-out case outside training.
 
-```text
-data/kh_holmboe_dataset_keep_epsilon.h5
-data/test_dataset_keep_epsilon.h5
-data/RM_summary_table.csv
-data/test_RM_summary_table.csv
-checkpoints/multihead_epsilon_flow_model.pt
-checkpoints/multihead_epsilon_flow_finetuned_external.pt
-```
-
-The expanded 5-variable augmented dataset can be regenerated with:
+## 1. Pretrain and extract features
 
 ```bash
-python scripts/build_kh_holmboe_dataset_augmented.py \
-  --root /Volumes/LaCie/Pr_1_KH_Holm \
-  --out_file /Volumes/LaCie/Pr_1_KH_Holm/ml_framework/experiment/kh_holmboe_dataset_augmented.h5 \
-  --chunk_dir /Volumes/LaCie/Pr_1_KH_Holm/ml_framework/experiment/kh_holmboe_dataset_augmented_chunks \
-  --reference_gyf_file /Volumes/LaCie/Pr_1_KH_Holm/KH/KH_test/Ri016_a10_Re1000/1/mean.h5 \
-  --n_x_profiles 100 \
-  --n_z_profiles 50 \
-  --time_window_offsets 0,25,50 \
-  --augmentation_fraction 0.3 \
-  --noise_stds 0,0.01,0.03 \
-  --downsample_factors 1,2,4
+python train_mae.py --preset small8 --out runs/source_mae
+
+python extract_tokens.py \
+  --ckpt runs/source_mae/last.pt \
+  --data data/pr1_combined_38case_dataset_v2.h5 \
+  --out outputs/pr1_tokens.h5
 ```
 
-See `docs/data_generation.md` for the old/new dataset comparison and the
-chunked build details.
+Default pretraining uses 200 epochs, batch size 32, AdamW with learning rate 1e-4 and weight decay 0.05, and ten warm-up epochs followed by cosine decay. The reconstruction loss is mean squared error over masked patches only. Checkpoints include the configuration; `last.pt` is the final saved epoch and `best.pt` is selected by validation loss.
 
-If your Drive folder is mounted somewhere else, pass it explicitly:
+## 2. Train the source regression head
 
 ```bash
-python scripts/setup_colab_drive_links.py \
-  --experiment_dir "/content/drive/MyDrive/ML_turbulence/experiment"
+python train_head.py \
+  --tokens outputs/pr1_tokens.h5 \
+  --labels-csv data/RM_summary_table.csv \
+  --val-cases 'Holmboe:Rib030_a05_Re1000,KH:Ri030_a05_Re1000,KH:Ri020_a10_Re2000,Holmboe:Rib012_a10_Re1000' \
+  --test-cases 'Holmboe:Rib020_a05_Re2000,KH:Ri020_a05_Re1000,Holmboe:Rib016_a10_Re2000,KH:Ri016_a10_Re2000' \
+  --seed 13 --batch-size 96 --lr 0.001 \
+  --out runs/source_head
 ```
 
-## Main Training
+The baseline uses mean squared error and an unconstrained linear output. Optional range penalties and sigmoid outputs are available through the command-line options. The encoder stays frozen because this step trains on extracted features. The selected head is saved as `head_best.pt`.
+
+## 3. Evaluate and adapt to target datasets
+
+Supply the four target HDF5 datasets and their labels locally:
 
 ```bash
-python src/train_multihead_epsilon_flow.py \
-  --h5 data/kh_holmboe_dataset_keep_epsilon.h5 \
-  --input_variables buoyancy,reduced_shear,log_epsilon \
-  --epochs 60 \
-  --batch_size 4 \
-  --lr 1e-4 \
-  --lambda_recon 1.0 \
-  --lambda_epsilon 1.0 \
-  --epsilon_input_mask_prob 0.5 \
-  --eval_force_mask_epsilon \
-  --mask_prob 0.15 \
-  --save checkpoints/multihead_epsilon_flow_model.pt \
-  --metrics_csv outputs/epsilon_flow_loss_history.csv \
-  --loss_plot outputs/epsilon_flow_loss_curves.png
+ENC=runs/source_mae/last.pt
+HEAD=runs/source_head/head_best.pt
+TARGETS='data/derecho_holmboe_Pr4_dataset1.h5,data/derecho_holmboe_Pr7_dataset2.h5,data/noisy_kh_dataset.h5,data/alexis_dataset.h5'
+TEST_CASES='derechoHB_Pr4:asymHol_Ri030_a05_Re1000,derechoHB_Pr4:asymKH_Ri016_a05_Re1000,derechoPr7_Holmboe:Ri016_a10_single,derechoPr7_Holmboe:Ri030_a05_single,noisyKH:Re2000_Ri016_Pr1_A01,Alexis:asym_KH'
+VAL_CASES='derechoHB_Pr4:symHol_Ri030_a00_Re1000'
+
+python finetune.py --mode zero-shot \
+  --enc-ckpt "$ENC" --head-ckpt "$HEAD" \
+  --data "$TARGETS" --labels-json data/all4_rm_labels.json \
+  --test-cases "$TEST_CASES" --val-cases "$VAL_CASES" \
+  --seed 13 --out runs/zero_shot_s13
+
+python finetune.py --mode head-only \
+  --enc-ckpt "$ENC" --head-ckpt "$HEAD" \
+  --data "$TARGETS" --labels-json data/all4_rm_labels.json \
+  --test-cases "$TEST_CASES" --val-cases "$VAL_CASES" \
+  --seed 13 --out runs/stage1_s13
+
+python finetune.py --mode lora --lora-all \
+  --enc-ckpt "$ENC" --init-ckpt runs/stage1_s13/best.pt \
+  --data "$TARGETS" --labels-json data/all4_rm_labels.json \
+  --test-cases "$TEST_CASES" --val-cases "$VAL_CASES" \
+  --lora-rank 8 --lora-alpha 16 \
+  --seed 13 --out runs/stage2_s13
 ```
 
-## Compact SharedFNO Training
+Stage 1 updates only the regression head. Stage 2 adds rank-8 LoRA updates to attention projections and feed-forward linear layers throughout the encoder, keeping the original encoder weights frozen and jointly optimizing the adapters and head. Stage 2 starts from the corresponding Stage 1 checkpoint. Use separate output directories for additional seeds.
 
-This newer experiment keeps the old encoder style but outputs a smaller latent
-feature:
+These commands describe the workflow. Exact reproduction of an individual historical run requires its dataset, checkpoint, and complete saved configuration.
 
-```text
-input: (B,3,491,200) -> compact latent: (B,64,50,20)
-```
-
-It does not condition the flow branch on `Pr`, `Ri`, `Re`, or `a`.
+## Visualization
 
 ```bash
-python src/train_shared_fno_rm_flow.py \
-  --h5 data/kh_holmboe_dataset_keep_epsilon.h5 \
-  --label_csv data/RM_summary_table.csv \
-  --input_variables buoyancy,reduced_shear,log_epsilon \
-  --epochs 100 \
-  --batch_size 4 \
-  --device cuda \
-  --save checkpoints/shared_fno_rm_flow_model.pt \
-  --metrics_csv outputs/shared_fno_rm_flow_loss_history.csv \
-  --loss_plot outputs/shared_fno_rm_flow_loss_curves.png
+python visualize_reconstruction.py --ckpt runs/source_mae/last.pt
+python plot_predictions.py
 ```
 
-Fine-tune from the pretrained SharedFNO checkpoint with the same schedule used
-by the earlier fine-tuning workflow:
+Reconstruction plots are written to `outputs/reconstruction/`. The distribution plot reads `inputs/plotted_panel_predictions.csv`, with columns `condition`, `case_id`, `seed`, `prediction`, and `true_rm`. Conditions are `source`, `zero_shot`, and `head_fine_tuned`; the default seeds are 13, 14, and 15. Prepare this combined per-panel CSV from your runs before plotting. The script writes a PNG to `outputs/prediction_distributions/`.
+
+Distributions pool panel predictions across seeds. Seed markers show each run's case-mean prediction. Variation across panels and variation across seed means are different statistics; density width is a display scale, not uncertainty in the true R_M.
+
+## Preparing new source data
+
+Edit `ROOT`, `DERECHO_ROOT`, and `REFERENCE_GYF_FILE` in `prepare_data.py` to point to your raw DNS directories, then run:
 
 ```bash
-python src/finetune_shared_fno_rm_flow.py \
-  --h5 data/test_dataset_keep_epsilon.h5 \
-  --label_csv data/test_RM_summary_table.csv \
-  --init_checkpoint checkpoints/shared_fno_rm_flow_model.pt \
-  --input_variables buoyancy,reduced_shear,log_epsilon \
-  --epochs 30 \
-  --heads_only_epochs 5 \
-  --batch_size 4 \
-  --lr 2e-5 \
-  --lambda_flow 0.2 \
-  --device cuda \
-  --save checkpoints/shared_fno_rm_flow_finetuned.pt \
-  --metrics_csv outputs/shared_fno_rm_flow_finetune_loss_history.csv \
-  --loss_plot outputs/shared_fno_rm_flow_finetune_loss_curves.png
+python prepare_data.py
 ```
 
-See `docs/shared_fno_colab.md` and `docs/shared_fno_rm_flow_pipeline.md` for
-Colab instructions and the architecture diagram.
+The builder reads `mean.h5` and `movie.h5` directly and writes `outputs/pr1_38case_dataset.h5`. Set `DATA_H5` to that output to train on newly generated data. The intended split is 30 training, four validation, and four test cases. Only discovered cases are processed, so all raw directories must be available to obtain the complete split.
 
-To visualize attention and RM saliency after training:
+The current builder adds 129 augmented panels to each training case: a complete build contains 12,870 training panels and 1,200 panels in each held-out split. The historical prepared dataset contains 12,612 training panels. The current reduced-shear calculation also differs from the historical preprocessing: it uses `(du/dy)^2 + (dw/dy)^2 - 4*dth/dy`. Its use of `dth/dy` assumes the input scalar has the intended buoyancy scaling; no additional Richardson-number factor is applied. New builds are therefore not a bitwise reproduction of the historical paper input. Preserve the original prepared data when reproducing historical results.
 
-```bash
-python src/inspect_shared_fno_attention.py \
-  --h5 data/kh_holmboe_dataset_keep_epsilon.h5 \
-  --label_csv data/RM_summary_table.csv \
-  --checkpoint checkpoints/shared_fno_rm_flow_model.pt \
-  --split val \
-  --sample 0 \
-  --device cuda \
-  --output_dir outputs/shared_fno_attention
-```
-
-## External Fine-Tuning
-
-```bash
-python src/train_multihead_epsilon_flow.py \
-  --h5 data/test_dataset_keep_epsilon.h5 \
-  --label_csv data/test_RM_summary_table.csv \
-  --init_checkpoint checkpoints/multihead_epsilon_flow_model.pt \
-  --input_variables buoyancy,reduced_shear,log_epsilon \
-  --epochs 30 \
-  --batch_size 4 \
-  --lr 2e-5 \
-  --lambda_recon 0.2 \
-  --lambda_epsilon 1.0 \
-  --epsilon_input_mask_prob 0.5 \
-  --eval_force_mask_epsilon \
-  --mask_prob 0.15 \
-  --save checkpoints/multihead_epsilon_flow_finetuned_external.pt \
-  --metrics_csv outputs/epsilon_flow_finetune_loss_history.csv \
-  --loss_plot outputs/epsilon_flow_finetune_loss_curves.png
-```
-
-## Test
-
-```bash
-python src/test_multihead_epsilon_flow.py \
-  --h5 data/test_dataset_keep_epsilon.h5 \
-  --label_csv data/test_RM_summary_table.csv \
-  --checkpoint checkpoints/multihead_epsilon_flow_finetuned_external.pt \
-  --split test \
-  --batch_size 16 \
-  --force_mask_epsilon \
-  --output_dir outputs/epsilon_flow_test_results_external
-```
-
-## Test-Time Downsample + Noise Experiments
-
-To measure how a trained model responds to degraded test inputs, run a sweep
-over test-time Gaussian noise and spatial downsampling. The checkpoint is fixed;
-the script does not retrain the model.
-
-```bash
-python src/run_downsample_noise_experiments.py \
-  --h5 data/test_dataset_keep_epsilon.h5 \
-  --label_csv data/test_RM_summary_table.csv \
-  --checkpoint checkpoints/multihead_epsilon_flow_finetuned_external.pt \
-  --downsample_factors 1.0,2.0,4.0,8.0,16.0,32.0 \
-  --noise_stds 0.0,0.01,0.05,0.1 \
-  --batch_size 16 \
-  --force_mask_epsilon \
-  --skip_existing \
-  --output_root outputs/test_input_robustness_sweep
-```
-
-The sweep writes per-run logs/results under `outputs/test_input_robustness_sweep/`
-and a combined summary table at `outputs/test_input_robustness_sweep/summary.csv`.
-`--downsample_factors 2.0` means the input fields are resized to half spatial
-resolution and then resized back to the model's expected input size before
-inference.
-`--skip_existing` is useful when extending an old sweep: existing runs are
-reused and only missing downsample/noise combinations are computed.
-
-## Visualize
-
-```bash
-python src/inspect_multihead_epsilon_flow.py \
-  --h5 data/test_dataset_keep_epsilon.h5 \
-  --label_csv data/test_RM_summary_table.csv \
-  --checkpoint checkpoints/multihead_epsilon_flow_finetuned_external.pt \
-  --split test \
-  --sample 0 \
-  --n_samples 5 \
-  --steps 32 \
-  --force_mask_epsilon \
-  --output_dir outputs/epsilon_flow_inspect_external
-```
-
-```bash
-python src/infer_log_epsilon_flow.py \
-  --h5 data/test_dataset_keep_epsilon.h5 \
-  --label_csv data/test_RM_summary_table.csv \
-  --checkpoint checkpoints/multihead_epsilon_flow_finetuned_external.pt \
-  --split test \
-  --sample 0 \
-  --n_samples 10 \
-  --steps 32 \
-  --output_dir outputs/log_epsilon_inference_external
-```
-
-## Provenance
-
-The final workflow comes from `Train_ML.ipynb`, especially cells 61-75:
-main epsilon-flow training, external fine-tuning, testing, inference, and
-attention visualization.
+Use `--help` on the training, feature-extraction, evaluation, and reconstruction scripts for additional options.

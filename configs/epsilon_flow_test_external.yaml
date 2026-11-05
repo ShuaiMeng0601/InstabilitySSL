@@ -1,8 +1,0 @@
-# Argument manifest for external evaluation.
-h5: data/test_dataset_keep_epsilon.h5
-label_csv: data/test_RM_summary_table.csv
-checkpoint: checkpoints/multihead_epsilon_flow_finetuned_external.pt
-split: test
-batch_size: 16
-force_mask_epsilon: true
-output_dir: outputs/epsilon_flow_test_results_external

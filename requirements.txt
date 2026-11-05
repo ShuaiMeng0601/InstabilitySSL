@@ -1,8 +1,5 @@
 torch
-numpy
+numpy>=2.0
+scipy
 h5py
-pandas
 matplotlib
-scikit-learn
-tqdm
-pyyaml
