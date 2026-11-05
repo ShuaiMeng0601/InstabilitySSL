@@ -7,7 +7,7 @@ the head as is, and the per-profile predictions are averaged per case.
 Labels come from the file's case_table_json (R_M) or from --labels-json.
 
 Usage:
-  python zeroshot_pr4.py --pr4-data <Pr4.h5> --out runs/zeroshot_pr4 \
+  python evaluate.py --pr4-data <Pr4.h5> --out runs/zeroshot_pr4 \
       --model "MAE v2 + FiLM" film <pr4 tokens.h5> runs/film_axial_v2/axial_seed13_pr1.pt \
       --model "MAE v2 + ConvNeXt" convnext <pr4 tokens.h5> runs/convnext_.../head_best.pt
 """
@@ -34,11 +34,15 @@ def load_tokens(h5, splits):
 
 
 def build_head(kind, ckpt, n_vars, device):
-    sd = torch.load(ckpt, map_location="cpu", weights_only=False)
+    saved = torch.load(ckpt, map_location="cpu", weights_only=False)
+    sd = saved.get("model", saved)
     if kind == "convnext":
-        model, sd = ConvNeXtHead(n_vars=n_vars), sd["model"]
+        out_act = saved.get("out_act")
+        if saved.get("args", {}).get("sigmoid_output"):
+            out_act = "sigmoid"
+        model = ConvNeXtHead(enc_dim=sd["reduce.weight"].shape[1], n_vars=n_vars, out_act=out_act)
     elif kind == "film":
-        model = FiLMAxialHead(n_vars=n_vars)
+        model = FiLMAxialHead(enc_dim=sd["in_norm.0.weight"].shape[0], n_vars=n_vars)
     else:
         raise SystemExit(f"unknown head kind: {kind}")
     model.load_state_dict(sd)  # strict: wrong pairing fails loudly

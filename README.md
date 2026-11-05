@@ -1,8 +1,8 @@
-# ShearSSL
+# InstabilitySSL
 
 **Inferring Stratified Shear Instability Character via Self-supervised Representation Learning**
 
-ShearSSL learns representations of stratified shear flows from DNS time–height panels and predicts the pseudomomentum ratio, R_M, as a continuous measure of instability character between Holmboe-like and Kelvin–Helmholtz-like limits.
+InstabilitySSL learns representations of stratified shear flows from DNS time–height panels and predicts the pseudomomentum ratio, R_M, as a continuous measure of instability character between Holmboe-like and Kelvin–Helmholtz-like limits.
 
 The main model combines a masked autoencoder (MAE) with a ConvNeXt regression head:
 
@@ -73,7 +73,7 @@ python train_head.py \
   --out runs/source_head
 ```
 
-The baseline uses mean squared error and an unconstrained linear output. Optional range penalties and sigmoid outputs are available through the command-line options. The encoder stays frozen because this step trains on extracted features. The selected head is saved as `head_best.pt`.
+The baseline uses mean squared error and an unconstrained linear output. Optional range penalties and sigmoid outputs are available through the command-line options. Evaluation and fine-tuning restore the activation recorded in a head checkpoint; for older checkpoints without this metadata, use the original run settings (including `--sigmoid-output` for fine-tuning). The encoder stays frozen because this step trains on extracted features. The selected head is saved as `head_best.pt`.
 
 ## 3. Evaluate and adapt to target datasets
 
@@ -113,7 +113,7 @@ These commands describe the workflow. Exact reproduction of an individual histor
 ## Visualization
 
 ```bash
-python visualize_reconstruction.py --ckpt runs/source_mae/last.pt
+python visualize_reconstruction.py --ckpt runs/source_mae/last.pt --data data/pr1_combined_38case_dataset_v2.h5
 python plot_predictions.py
 ```
 
@@ -129,8 +129,16 @@ Edit `ROOT`, `DERECHO_ROOT`, and `REFERENCE_GYF_FILE` in `prepare_data.py` to po
 python prepare_data.py
 ```
 
-The builder reads `mean.h5` and `movie.h5` directly and writes `outputs/pr1_38case_dataset.h5`. Set `DATA_H5` to that output to train on newly generated data. The intended split is 30 training, four validation, and four test cases. Only discovered cases are processed, so all raw directories must be available to obtain the complete split.
+The builder reads `mean.h5` and `movie.h5` directly and writes `outputs/pr1_38case_dataset.h5`. Set `DATA_H5` to that output to train on newly generated data. The intended split is 30 training, four validation, and four test cases. Windows start at the first local maximum of the integrated RMS velocity at t >= 30; if none exists, the current implementation falls back to the global maximum. A late start is shifted earlier to fit 200 saved frames. Only discovered cases are processed, so all raw directories must be available to obtain the complete split.
 
 The current builder adds 129 augmented panels to each training case: a complete build contains 12,870 training panels and 1,200 panels in each held-out split. The historical prepared dataset contains 12,612 training panels. The current reduced-shear calculation also differs from the historical preprocessing: it uses `(du/dy)^2 + (dw/dy)^2 - 4*dth/dy`. Its use of `dth/dy` assumes the input scalar has the intended buoyancy scaling; no additional Richardson-number factor is applied. New builds are therefore not a bitwise reproduction of the historical paper input. Preserve the original prepared data when reproducing historical results.
 
 Use `--help` on the training, feature-extraction, evaluation, and reconstruction scripts for additional options.
+
+## Validation and reproducibility
+
+The current code has passed CPU checks of the pretraining, feature extraction, source regression, zero-shot, head-only, LoRA, full fine-tuning, and plotting workflows on small inputs. A separate comparison with the original implementation matched 924 arrays exactly, including losses, gradients, one-step parameter updates, and features/predictions from the saved MAE v2 and source-head checkpoints on one real panel. These checks do not replace full training runs or a complete regeneration of the DNS dataset.
+
+The noisy-KH dataset lacks dissipation; NaNs in that input channel are filled with -0.62, the source-training mean used in the original workflow. Non-finite buoyancy or reduced-shear inputs are rejected. Regression heads currently expect a 31 × 20 token grid.
+
+MAE `--resume` restores model and optimizer weights, but does not restore random-number or AMP-scaler states. Supply the same architecture and training settings when resuming; an interrupted run is not guaranteed to match an uninterrupted run exactly. Use a fresh output directory for each new experiment.

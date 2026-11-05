@@ -46,6 +46,7 @@ def load_model(ckpt_path, device):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--ckpt", required=True)
+    ap.add_argument("--data", help="HDF5 path override if the checkpoint's original data path has moved")
     ap.add_argument("--split", default="val")
     ap.add_argument("--n", type=int, default=4)
     ap.add_argument("--device", default="cpu")
@@ -57,6 +58,8 @@ def main():
 
     device = torch.device(args.device)
     model, cfg, epoch = load_model(args.ckpt, device)
+    if args.data:
+        cfg.h5_path = args.data
     out_dir = Path(args.out) if args.out else Path(__file__).resolve().parent / "outputs/reconstruction"
     out_dir.mkdir(parents=True, exist_ok=True)
 

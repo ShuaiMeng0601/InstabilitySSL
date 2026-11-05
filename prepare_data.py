@@ -196,6 +196,8 @@ def get_frames(run_dirs):
 def build_case(family, case_name, run_dirs, target_y):
     case_id = f'{family}:{case_name}' #'KH:Ri020_a05_Re1000'
     frames, urms = get_frames(run_dirs)
+    if len(frames) < NT_NEW:
+        raise ValueError(f'{case_id}: need {NT_NEW} frames, found {len(frames)}.')
     times = np.array([frame['time'] for frame in frames])
     peak = first_local_peak(urms, times)
     start = min(peak, len(frames) - NT_NEW) 
@@ -218,7 +220,7 @@ def build_case(family, case_name, run_dirs, target_y):
                     group_name = movie_group(name, plane)
                     snapshots[name][plane] = f[f'{group_name}/{key}'][:]
                     if not np.isfinite(snapshots[name][plane]).all(): # Nan or Inf
-                        return None, None
+                        raise ValueError(f'{case_id}: NaN/Inf in {group_name}/{key}.')
         snapshots = derived_snapshots(snapshots, old_y)
         for v, name in enumerate(VARIABLES):
             xy, zy = snapshots[name]['xy'], snapshots[name]['zy']
@@ -395,7 +397,6 @@ def main():
             if split == 'train':
                 n_clean += len(data)
                 n_aug = int(round(len(data) * AUG_PER_CLEAN))
-                # 保留原实验两批数据各自的随机种子命名。
                 seed_case = f'derechoPr1_{case}' if runs[0].is_relative_to(DERECHO_ROOT) else case
                 rng = np.random.default_rng([RANDOM_SEED, zlib.crc32(seed_case.encode())])
                 rows = rng.choice(len(data), size=n_aug, replace=False)

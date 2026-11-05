@@ -17,7 +17,7 @@ convnext_rm.py: profile-level MSE, case-level eval (mean over profiles),
 early stop on val case-MAE, test cases predicted once with the best model.
 
 Usage:
-  python finetune_pr4.py --mode lora \
+  python finetune.py --mode lora \
       --enc-ckpt runs/small8_38case_v2/best.pt \
       --head-ckpt runs/convnext_small8_38case_v2/head_best.pt \
       --out runs/pr4_lora_small8_38case_v2
@@ -164,9 +164,11 @@ def load_pr4_labels(labels_json=None):
     data file's case_table_json (works for the Pr=4 file; the Pr=7 file carries no R_M)."""
     if labels_json:
         labels = {}
-        for item in labels_json.split(","):
-            p = Path(item.strip())
-            table = json.loads(p.read_text() if p.exists() else labels_json)
+        if labels_json.lstrip().startswith("{"):
+            tables = [json.loads(labels_json)]
+        else:
+            tables = [json.loads(Path(p.strip()).read_text()) for p in labels_json.split(",")]
+        for table in tables:
             labels.update(
                 {cid: float(v if not isinstance(v, dict) else v["R_M"]) for cid, v in table.items()}
             )
@@ -249,6 +251,15 @@ def case_metrics(preds, cids, labels):
     return {"mae": mae, "rmse": rmse, "r2": r2}, rows
 
 
+def write_predictions(path, model, data, labels, device):
+    with open(path, "w", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow(["split", "case_id", "plane", "axis_index", "true", "pred", "error"])
+        for split in ("val", "test"):
+            for cid, plane, index, pred in predict_rows(model, *data[split], device):
+                writer.writerow([split, cid, plane, index, labels[cid], pred, pred - labels[cid]])
+
+
 ALL_GROUPS = ["train", "val", "test"]
 
 
@@ -259,7 +270,7 @@ def loader_rows(loader, ds):
     return [int(ds.indices[i]) for i in pos]
 
 
-def make_custom_split(args):
+def make_custom_split(args, y_pad_to=496):
     """Reassign the file's cases: --test-cases (required), --val-cases (optional),
     --train-cases (default: every other case). Samples are pooled over the file's
     train/val/test groups, clean profiles only. Without --val-cases, --val-frac of
@@ -271,7 +282,7 @@ def make_custom_split(args):
         csv_list(args.train_cases),
     )
     pool = KHHolmboeDataset(
-        DATA_H5, ALL_GROUPS, y_pad_to=496, include_augmented=False, exclude_invalid=False
+        DATA_H5, ALL_GROUPS, y_pad_to=y_pad_to, include_augmented=False, exclude_invalid=False
     )
     all_cases = sorted({m["case_id"] for m in pool.metadata})
     unknown = [c for c in test_cases + val_cases + train_cases if c not in all_cases]
@@ -281,12 +292,14 @@ def make_custom_split(args):
         train_cases = [c for c in all_cases if c not in test_cases and c not in val_cases]
     if set(train_cases) & set(test_cases) or set(val_cases) & set(test_cases):
         raise SystemExit("LEAKAGE: a test case is also in train or val")
+    if set(train_cases) & set(val_cases):
+        raise SystemExit("LEAKAGE: a validation case is also in train")
 
     def case_ds(cases):
         return KHHolmboeDataset(
             DATA_H5,
             ALL_GROUPS,
-            y_pad_to=496,
+            y_pad_to=y_pad_to,
             include_augmented=False,
             exclude_invalid=False,
             keep_cases=cases,
@@ -413,6 +426,8 @@ def main():
     ap.add_argument("--seed", type=int, default=13)
     ap.add_argument("--device", default="cuda")
     args = ap.parse_args()
+    if args.mode == "zero-shot" and not (args.head_ckpt or args.init_ckpt):
+        ap.error("zero-shot requires --head-ckpt or --init-ckpt")
 
     global DATA_H5
     if args.data:
@@ -435,26 +450,35 @@ def main():
         jc = ck["config"]
         mae = ConvEncoder2D(3, jc["dims"], jc["blocks"], jc["strides"])
         mae.load_state_dict(ck["encoder"])
+        enc_dim, n_vars, y_pad_to = mae.out_dim, 1, 496
     else:
         cfg = make_config(ck["config"].get("preset", "small8"))
+        for key, value in ck["config"].items():
+            if key in vars(cfg):
+                setattr(cfg, key, value)
+        if (cfg.grid_y, cfg.grid_t) != (31, 20):
+            raise ValueError("The regression heads expect a 31 x 20 token grid.")
         mae = MAEViT(cfg)
         mae.load_state_dict(ck["model"])
+        enc_dim, n_vars, y_pad_to = cfg.enc_dim, cfg.n_vars, cfg.y_pad_to
     print(f"encoder ({'conv-JEPA' if is_jepa else 'MAE'}): {args.enc_ckpt} (epoch {ck['epoch']})")
 
     # head
     if args.head_type == "film":
         if is_jepa:
             raise SystemExit("FiLM head expects the 3-variable MAE token grid")
-        head = FiLMAxialHead(n_vars=3)
+        head = FiLMAxialHead(enc_dim=enc_dim, n_vars=n_vars)
     else:
         head = ConvNeXtHead(
-            n_vars=1 if is_jepa else 3, out_act="sigmoid" if args.sigmoid_output else None
+            enc_dim=enc_dim, n_vars=n_vars, out_act="sigmoid" if args.sigmoid_output else None
         )
     if args.sigmoid_output and args.head_type != "convnext":
         raise SystemExit("--sigmoid-output is implemented for the ConvNeXt head only")
-    print(f"head output activation: {getattr(head, 'out_act', None)}")
     if args.head_ckpt and not args.init_ckpt:
         hck = torch.load(args.head_ckpt, map_location="cpu", weights_only=False)
+        if args.head_type == "convnext":
+            if hck.get("out_act") == "sigmoid" or hck.get("args", {}).get("sigmoid_output"):
+                head.out_act = "sigmoid"
         head.load_state_dict(hck["model"] if isinstance(hck, dict) and "model" in hck else hck)
         print(f"head ({args.head_type}) initialized from {args.head_ckpt}")
 
@@ -469,8 +493,9 @@ def main():
         )
         print(f"LoRA: {n} adapters, rank {args.lora_rank}, alpha {args.lora_alpha}")
     if args.mode == "full":
-        for p in mae.parameters():
-            p.requires_grad_(True)
+        for name, p in mae.named_parameters():
+            if is_jepa or name.startswith(("patch_embed.", "var_embed_enc", "cls_token", "enc_blocks.", "enc_norm.")):
+                p.requires_grad_(True)
 
     encoder_grad = args.mode in ("lora", "full")
     model = (
@@ -481,6 +506,9 @@ def main():
 
     if args.init_ckpt:
         ick = torch.load(args.init_ckpt, map_location="cpu", weights_only=False)
+        if args.head_type == "convnext":
+            if ick.get("out_act") == "sigmoid" or ick.get("args", {}).get("sigmoid_output"):
+                head.out_act = "sigmoid"
         state = ick["model"]
         own = model.state_dict()
         if any(".base." in k for k in own) and not any(".base." in k for k in state):
@@ -499,6 +527,10 @@ def main():
             f"fresh LoRA tensors: {len(missing)}"
         )
 
+    args.sigmoid_output = getattr(head, "out_act", None) == "sigmoid"
+    (out / "args.json").write_text(json.dumps(vars(args), indent=1))
+    print(f"head output activation: {getattr(head, 'out_act', None)}")
+
     n_train = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print(f"mode={args.mode}  trainable params {n_train/1e6:.3f}M")
 
@@ -506,17 +538,18 @@ def main():
     data = {}
     split_record = "file's own train/val/test groups"
     if args.test_cases:
-        data, split_record = make_custom_split(args)
+        data, split_record = make_custom_split(args, y_pad_to=y_pad_to)
     else:
         for split in ["train", "val", "test"]:
             ds, loader = make_pr4_loader(
-                split, args.batch_size, args.clean_only, shuffle=(split == "train")
+                split, args.batch_size, args.clean_only, shuffle=(split == "train"), y_pad_to=y_pad_to
             )
             data[split] = (ds, loader)
     for split, (ds, loader) in data.items():
         kept = sorted({ds.metadata[r]["case_id"] for r in loader_rows(loader, ds)})
         print(f"{split}: {len(loader.dataset)} samples, cases: {kept}")
-    missing = [c for s in data.values() for m in s[0].metadata if (c := m["case_id"]) not in labels]
+    missing = [ds.meta(r)["case_id"] for ds, loader in data.values()
+               for r in loader_rows(loader, ds) if ds.meta(r)["case_id"] not in labels]
     assert not missing, f"missing Pr=4 labels: {sorted(set(missing))}"
 
     results = {
@@ -542,6 +575,7 @@ def main():
             for c, r in sorted(rows.items()):
                 print(f"  {c:44s} true {r['true']:.4f}  pred {r['pred']:.4f}")
         (out / "results.json").write_text(json.dumps(results, indent=1))
+        write_predictions(out / "per_profile_predictions.csv", model, data, labels, device)
         return
 
     # ---- training ----
@@ -556,7 +590,9 @@ def main():
     scaler = torch.amp.GradScaler("cuda", enabled=device.type == "cuda")
 
     tr_ds, tr_loader = data["train"]
-    tr_y = {m_i: labels[m["case_id"]] for m_i, m in enumerate(tr_ds.metadata)}
+    if len(tr_loader) == 0:
+        raise ValueError("No full training batch; reduce --batch-size.")
+    tr_y = {r: labels[tr_ds.meta(r)["case_id"]] for r in loader_rows(tr_loader, tr_ds)}
 
     logp = out / "log.csv"
     with open(logp, "w", newline="") as f:
@@ -606,7 +642,8 @@ def main():
         if vm["mae"] < best["mae"]:
             best = {"mae": vm["mae"], "epoch": epoch}
             torch.save(
-                {"model": model.state_dict(), "epoch": epoch, "val_case_mae": vm["mae"]},
+                {"model": model.state_dict(), "epoch": epoch, "val_case_mae": vm["mae"],
+                 "out_act": getattr(head, "out_act", None), "args": vars(args), "config": ck["config"]},
                 out / "best.pt",
             )
         elif epoch - best["epoch"] >= args.patience:
@@ -624,22 +661,7 @@ def main():
     (out / "results.json").write_text(json.dumps(results, indent=1))
     print(f"\nsaved {out}/results.json")
     # every profile's prediction (val + test), with its plane / horizontal index
-    with open(out / "per_profile_predictions.csv", "w", newline="") as f:
-        w = csv.writer(f)
-        w.writerow(["split", "case_id", "plane", "axis_index", "true", "pred", "error"])
-        for split in ["val", "test"]:
-            for cid, plane, idx, p in predict_rows(model, *data[split], device):
-                w.writerow(
-                    [
-                        split,
-                        cid,
-                        plane,
-                        idx,
-                        f"{labels[cid]:.4f}",
-                        f"{p:.5f}",
-                        f"{p - labels[cid]:+.5f}",
-                    ]
-                )
+    write_predictions(out / "per_profile_predictions.csv", model, data, labels, device)
     print(f"saved {out}/per_profile_predictions.csv")
 
 

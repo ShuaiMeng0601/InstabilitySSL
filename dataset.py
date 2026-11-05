@@ -119,13 +119,16 @@ class KHHolmboeDataset(Dataset):
         row = int(self.indices[i])
         fi, grp, local = self._loc[row]
         x = self._h5(fi)[f"{grp}/X"][local]  # (3, 491, 200) float32
-        if np.isnan(x).any():
+        if np.isnan(x[2]).any():
             # a file built without epsilon (noisy_kh_dataset.h5) stores log_epsilon
             # as all-NaN; the pretrained encoders need 3 channels, so fill with a
             # constant: the Pr=1 training-set mean of the normalized channel
-            x = np.where(np.isnan(x), LOG_EPS_NAN_FILL, x).astype(np.float32)
-        if self.pad_top or self.pad_bottom:
-            x = np.pad(x, ((0, 0), (self.pad_top, self.pad_bottom), (0, 0)), mode="edge")
+            x[2] = np.where(np.isnan(x[2]), LOG_EPS_NAN_FILL, x[2])
+        if not np.isfinite(x).all():
+            raise ValueError(f"Non-finite input in {self.paths[fi]}, {grp}, row {local}.")
+        pad = self.y_pad_to - x.shape[1]
+        if pad:
+            x = np.pad(x, ((0, 0), (pad // 2, pad - pad // 2), (0, 0)), mode="edge")
         return torch.from_numpy(np.ascontiguousarray(x)), row
 
     def meta(self, row):
@@ -165,10 +168,12 @@ def load_rm_labels(csv_path):
     with open(csv_path, newline="") as f:
         for row in csv.DictReader(f):
             if row.get("case_id"):
-                labels[row["case_id"].strip()] = float(row["R_M"])
+                cid = row["case_id"].strip().replace(":Rib", ":Ri")
+                labels[cid] = float(row["R_M"])
                 continue
             fam = "KH" if "KH" in row["Type"] else "Holmboe"
             ri = f"Ri{round(float(row['Ri']) * 100):03d}"
-            amap = {"0.5": "a05", "1": "a10", "sym": "sym"}[row["a"].strip()]
-            labels[f"{fam}:{ri}_{amap}_Re{row['Re']}"] = float(row["R_M"])
+            a = row["a"].strip()
+            amap = "sym" if a == "sym" else f"a{round(float(a) * 10):02d}"
+            labels[f"{fam}:{ri}_{amap}_Re{int(float(row['Re']))}"] = float(row["R_M"])
     return labels

@@ -12,7 +12,7 @@ DEFAULT_STRIDES = ((2, 2), (2, 5), (2, 1), (2, 1)) #used in jepa
 
 # Masking
 def random_spatial_mask(batch_size, n_patches, mask_ratio, generator=None):
-    """(B, L) boolean mask with exactly round(L * mask_ratio) True per row."""
+    """(B, L) mask: False is visible; keep at least one patch per sample."""
     len_keep = int(round(n_patches * (1.0 - mask_ratio))) # patchs kept
     len_keep = max(1, min(n_patches, len_keep))
     noise = torch.rand(batch_size, n_patches, generator=generator) #(batch_size, n_patches)
@@ -119,7 +119,7 @@ class MAEViT(nn.Module):
         self.dec_norm = nn.LayerNorm(cfg.dec_dim)
         self.head = nn.Linear(cfg.dec_dim, p)
 
-        # set the initialization values for all params
+        # Initialize the learned tokens and variable embeddings.
         nn.init.normal_(self.cls_token, std=0.02)
         nn.init.normal_(self.mask_token, std=0.02)
         nn.init.normal_(self.var_embed_enc, std=0.02)
@@ -197,6 +197,8 @@ class MAEViT(nn.Module):
         if spatial_mask is None:
             spatial_mask = random_spatial_mask(B, self.L, self.mask_ratio, generator)
         spatial_mask = spatial_mask.to(x.device)
+        if not spatial_mask.any():
+            raise ValueError("Reconstruction loss needs masked patches; use encode_features for unmasked input.")
 
         latent, token_ids = self.forward_encoder(x, spatial_mask)
         pred = self.forward_decoder(latent, token_ids).reshape(B, self.V, self.L, self.p)

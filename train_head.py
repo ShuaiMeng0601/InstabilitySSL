@@ -8,7 +8,7 @@ val), so any reshuffle among the held-out 8 stays leakage-free. The fit set is
 always the cache's train group (30 cases) — untouched.
 
 Usage:
-  python convnext_rm_custom.py --tokens ../features/tokens_<run>.h5 \
+  python train_head.py --tokens ../features/tokens_<run>.h5 \
       --val-cases "Holmboe:Rib030_a05_Re1000,Holmboe:Rib016_a10_Re2000,KH:Ri030_a05_Re1000,KH:Ri020_a10_Re2000" \
       --test-cases "Holmboe:Rib020_a05_Re2000,Holmboe:Rib012_a10_Re1000,KH:Ri020_a05_Re1000,KH:Ri016_a10_Re2000" \
       --out runs/convnext_<run>_split2
@@ -156,7 +156,7 @@ def main():
     for c in val_cases + test_cases:
         if c not in by_case:
             raise SystemExit(f"case not in token cache: {c}")
-        if c not in held_out:
+        if c not in held_out or c in orig.get("train", set()):
             raise SystemExit(
                 f"LEAKAGE: {c} is a pretraining train case; "
                 "reassigning it requires re-pretraining."
@@ -166,6 +166,8 @@ def main():
 
     fit_cases = sorted(orig["train"])
     fit_tok = torch.cat([by_case[c] for c in fit_cases])
+    if len(fit_tok) < args.batch_size:
+        raise ValueError("Training set is smaller than batch size; reduce --batch-size.")
     fit_y = torch.cat([torch.full((len(by_case[c]),), labels[norm_case_id(c)]) for c in fit_cases])
     print(f"fit: {len(fit_cases)} cases / {len(fit_tok)} samples (pretraining train split)")
     for tag, cs in [("val", val_cases), ("test", test_cases)]:
@@ -180,7 +182,8 @@ def main():
             )
 
     model = ConvNeXtHead(
-        n_vars=fit_tok.shape[1], out_act="sigmoid" if args.sigmoid_output else None
+        enc_dim=fit_tok.shape[-1], n_vars=fit_tok.shape[1],
+        out_act="sigmoid" if args.sigmoid_output else None
     ).to(device)
     print(f"head output activation: {model.out_act}")
     print(f"range penalty: lambda={args.range_penalty}, mode={args.range_penalty_mode}")

@@ -119,6 +119,8 @@ def main():
 
     # 2. Training, validation, and optional monitoring data.
     train_loader = make_loader(cfg, "train", limit=args.limit_train)
+    if len(train_loader) == 0:
+        raise ValueError("No full training batch; reduce --batch-size or increase --limit-train.")
     val_cases = [c.strip() for c in (args.val_cases or "").split(",") if c.strip()]
     test_cases = [c.strip() for c in (args.test_cases or "").split(",") if c.strip()]
     val_split = ["val", "test"] if val_cases else "val"
